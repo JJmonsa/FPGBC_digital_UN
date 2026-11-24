@@ -1,0 +1,11 @@
+*backups/
+.venv/
+.pixi/
+build*/
+~F*
+.vscode/
+__pycache__/
+.toolchain/
+.nextpnr/
+eda_test.log
+/.nvim/
