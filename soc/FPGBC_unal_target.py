@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+
+#
+# This file is part of LiteX-Boards.
+# Tang Nano 20k
+# Copyright (c) 2022 Icenowy Zheng <icenowy@aosc.io>
+# Copyright (c) 2022 Florent Kermarrec <florent@enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+# Tang Nano 9k
+# Copyright (c) 2022 Icenowy Zheng <icenowy@aosc.io>
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Adaptado para FPGBC unal
+#
+from migen import *
+
+from litex.gen import *
+
+from litex.soc.cores.clock.gowin_gw2a import GW2APLL
+from litex.soc.integration.soc import *
+from litex.soc.integration.soc import SoCRegion
+from litex.soc.integration.builder import *
+from litex.soc.cores.gpio import GPIOIn
+from litex.soc.interconnect import wishbone
+
+from litex.soc.cores.ram.gowin_hyperram import GowinHyperRAM
+
+import FPGBC_unal_platform
+from femtorv32_intermissum import FemtoRVIntermissumIRQ
+
+# CRG ----------------------------------------------------------------------------------------------
+
+class _CRG(LiteXModule):
+    def __init__(self, platform, sys_clk_freq, with_hyperram, hyperram_clk_ratio="4:1"):
+        self.rst      = Signal()#Litex resuelve por detras
+        self.cd_sys   = ClockDomain()
+        self.cd_por   = ClockDomain()
+        # Clk
+        clk40 = platform.request("clk40")
+        # Boton push de volumen, unicamente para debug
+        rst_n = platform.request("global_rst_n")
+        
+        # Power on reset
+        por_count = Signal(16, reset=2**16-1)
+        por_done  = Signal()
+        self.comb += self.cd_por.clk.eq(clk40)
+        self.comb += por_done.eq(por_count == 0)
+        self.sync.por += If(~por_done, por_count.eq(por_count - 1))
+
+        # PLL
+        self.pll = pll = GW2APLL(devicename=platform.devicename, device=platform.device)
+        self.comb += pll.reset.eq(~rst_n | self.rst)
+        pll.register_clkin(clk40, 40e6)
+        pll.create_clkout(self.cd_sys, sys_clk_freq)
+
+        # HyperRAM Clock.
+        # El PHY de HyperRAM corre en sys4x con clk_ratio="4:1" y en sys2x con "2:1".
+        if with_hyperram:
+            if hyperram_clk_ratio == "4:1":
+                self.cd_sys4x = ClockDomain()
+                pll.create_clkout(self.cd_sys4x, 4*sys_clk_freq)
+            elif hyperram_clk_ratio == "2:1":
+                self.cd_sys2x = ClockDomain()
+                pll.create_clkout(self.cd_sys2x, 2*sys_clk_freq)
+            else:
+                raise ValueError(f"Unsupported HyperRAM clock ratio: {hyperram_clk_ratio}")
+
+
+# BaseSoC ------------------------------------------------------------------------------------------
+
+class BaseSoC(SoCCore):
+    def __init__(self, toolchain="apicula", sys_clk_freq=40e6,
+        with_spi_flash       = False,
+        with_game_buttons = False,
+        with_volume_buttons = False,
+        **kwargs):
+
+        platform = FPGBC_unal_platform.Platform(toolchain=toolchain)
+        # CRG --------------------------------------------------------------------------------------
+        # PSRAM integrada: se usa como main_ram cuando no hay RAM integrada
+        # (--integrated-main-ram-size 0), igual que en sipeed_tang_nano_9k.
+        with_hyperram = not kwargs.get("integrated_main_ram_size", 0)
+        hyperram_clk_ratio = "2:1"
+
+        self.crg = _CRG(platform, sys_clk_freq, with_hyperram, hyperram_clk_ratio)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        class GB_Link_UART_Pads:
+                pass
+        gb_link_uart_pads = GB_Link_UART_Pads()
+        gb_link_pads = platform.request("GB_Link")
+        gb_link_uart_pads.tx = gb_link_pads.serial_out
+        gb_link_uart_pads.rx = gb_link_pads.serial_in
+        
+        SoCCore.__init__(self, platform, sys_clk_freq, ident="LiteX SoC on FPGBC", uart_pads=gb_link_uart_pads, **kwargs)
+
+        # SPI Flash: 25Q16JVSIQ ----------------------------------------------------------------------
+        if with_spi_flash:
+            from litespi.modules import W25Q16JV as SpiFlashModule
+            from litespi.opcodes import SpiNorFlashOpCodes as Codes
+            self.add_spi_flash(mode="1x", module=SpiFlashModule(Codes.READ_1_1_1))
+        
+        #HyperRAM/PSRAM ---------------------------------------------------------------------------------
+        #https://github.com/litex-hub/litex-boards/blob/master/litex_boards/targets/sipeed_tang_nano_9k.py
+        if with_hyperram:
+            class HyperRAMPads:
+                pass
+            hyperram_pads = HyperRAMPads()
+            hyperram_pads.clk    = platform.request("O_psram_ck")
+            hyperram_pads.clk_n  = platform.request("O_psram_ck_n")
+            hyperram_pads.cs_n   = platform.request("O_psram_cs_n")
+            hyperram_pads.rst_n  = platform.request("O_psram_reset_n")
+            hyperram_pads.dq     = platform.request("IO_psram_dq")
+            hyperram_pads.rwds   = platform.request("IO_psram_rwds")
+            self.hyperram = GowinHyperRAM(hyperram_pads, sys_clk_freq=sys_clk_freq, clk_ratio=hyperram_clk_ratio)
+            #Por que se usa ese clk ratio? Por velocidad, se puede acceder a los datos de la ram antes de que el procesador los necesite
+            self.bus.add_slave("main_ram", slave=self.hyperram.bus, region=SoCRegion(origin=self.mem_map["main_ram"], size=4 * MEGABYTE, mode="rwx"))
+        
+        #La ram correcta es PSRAM https://github.com/YosysHQ/apicula/issues/332
+        # que considerando instrucciones y datos de 32 bits se considera un _tamaño_ de $\frac{64e6}{8} \frac{1}{2} = 4MB$,
+        
+        # Buttons ----------------------------------------------------------------------------------
+        if with_game_buttons:
+            self.game_buttons = GPIOIn(pads=platform.request("game_buttons_n"),with_irq=self.irq.enabled)
+            if self.irq.enabled: 
+                self.irq.add("game_buttons", use_loc_if_exists=True)
+        #if with_volume_buttons:    
+        #    self.volume_buttons = GPIOIn(pads=platform.request("volume_buttons_n"),with_irq=self.irq.enabled)
+        #    if self.irq.enabled: 
+        #        self.irq.add("volume_buttons", use_loc_if_exists=True)
+
+        # Grabador de Cartucho (gbbus.v) ---------------------------------------------------
+        cart_pads = platform.request("cart")
+        cart_wb = wishbone.Interface()
+        self.bus.add_slave("gbbus", cart_wb, SoCRegion(origin=0x00470000, size=0x100, cached=False))
+
+        gb_d_ts = TSTriple(8)
+        self.specials += gb_d_ts.get_tristate(cart_pads.d)
+
+        gb_d_oe = Signal()
+        self.comb += [
+            cart_pads.clk.eq(0),
+            cart_pads.oe_n.eq(0),
+            gb_d_ts.oe.eq(gb_d_oe),
+            cart_wb.ack.eq(cart_wb.cyc & cart_wb.stb),
+        ]
+
+        self.specials += Instance("gbbus",
+            i_clk      = ClockSignal("sys"),
+            i_resetn   = ~ResetSignal("sys"),
+            i_cs       = cart_wb.cyc & cart_wb.stb,
+            i_wr       = cart_wb.cyc & cart_wb.stb & cart_wb.we,
+            i_rd       = cart_wb.cyc & cart_wb.stb & ~cart_wb.we,
+            i_addr     = Cat(Signal(2), cart_wb.adr[:3]),
+            i_d_in     = cart_wb.dat_w,
+            o_d_out    = cart_wb.dat_r,
+            o_gb_a     = cart_pads.a,
+            o_gb_d_out = gb_d_ts.o,
+            i_gb_d_in  = gb_d_ts.i,
+            o_gb_d_oe  = gb_d_oe,
+            o_gb_dir   = cart_pads.dir,
+            o_gb_cs_n  = cart_pads.cs_n,
+            o_gb_rd_n  = cart_pads.rd_n,
+            o_gb_wr_n  = cart_pads.wr_n,
+        )
+        platform.add_source(os.path.join(os.path.dirname(__file__), "gbbus.v"))
+
+# Build --------------------------------------------------------------------------------------------
+
+def main():
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=FPGBC_unal_platform.Platform, description="LiteX SoC on Tang Nano 20K.")
+    parser.add_target_argument("--flash",          action="store_true",      help="Flash bitstream.")
+    #parser.add_target_argument("--prog-kit",       default="openfpgaloader", help="Programmer select from Gowin/openFPGALoader.")
+    parser.add_target_argument("--sys-clk-freq",   default=40e6, type=float, help="System clock frequency.")
+    #parser.add_target_argument("--with-spi-flash", action="store_true",      help="Enable memory-mapped SPI flash.")
+    #parser.add_argument("--with-gb-link-uart",action="store_true",default=True,help="UART via GB Link Port")
+    parser.add_target_argument("--with-game-buttons", action="store_true", help="Habilitar botones de juego")
+    parser.add_target_argument("--with-volume-buttons", action= "store_true", help="Habilitar botones de volumen")
+    
+    parser.set_defaults(
+        cpu_type="femtorv",
+        cpu_variant="intermissum",#Soporte para interrupciones, no tiene soporte por parte de LiteX
+        toolchain="apicula",
+        integrated_main_ram_size = 0x4000,#16KiB ~16KB
+        with_game_buttons = True
+        )
+    args = parser.parse_args()
+    soc = BaseSoC(
+        toolchain            = args.toolchain,
+        sys_clk_freq         = args.sys_clk_freq,
+        with_spi_flash       = True,
+        with_game_buttons = args.with_game_buttons,
+        with_volume_buttons = args.with_volume_buttons, 
+        **parser.soc_argdict
+    )
+
+    builder = Builder(soc, **parser.builder_argdict)
+    builder.add_software_package(name="lib_unal",src_dir=os.path.abspath(os.path.join(os.path.dirname(__file__),"../firmware/lib_unal")))
+    builder.add_software_library(name="lib_unal")
+    if args.build:
+        builder.build(**parser.toolchain_argdict)
+
+    if args.load:
+        prog = soc.platform.create_programmer()
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
+
+    if args.flash:
+        prog = soc.platform.create_programmer()
+        prog.flash(0, builder.get_bitstream_filename(mode="flash", ext=".fs"), external=True)
+
+if __name__ == "__main__":
+    main()
